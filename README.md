@@ -2,9 +2,10 @@
 
 A Windows GUI terminal for **PowerShell**, from EX Inc.
 
-Runs a **persistent** PowerShell session (so `cd` and variables stick), streams output live, and can relaunch itself as administrator when you need elevated rights.
+Runs a **persistent ConPTY PowerShell** session (pywinpty) (so `cd` and variables stick), streams output live, and can relaunch itself as administrator when you need elevated rights.
 
 ## Features
+- **ConPTY**: interactive tools like `grok` run inside this window (keys forwarded while Running).
 - Black/grey UI with monospace output and an input line (↑/↓ history, Enter to run, Ctrl+C to stop).
 - **Run as admin** relaunches the app elevated (ShellExecute `runas`).
 - **Install Grok CLI** one-click button runs: `irm https://x.ai/cli/install.ps1 | iex` (only when you click it).
@@ -16,6 +17,7 @@ Runs a **persistent** PowerShell session (so `cd` and variables stick), streams 
 2. SmartScreen may warn (unsigned): **More info → Run anyway**.
 
 ## Limitations
+- Needs a real Windows console host (ConPTY). Under Wine, interactive input can be flaky.
 - Interactive prompts that wait for keyboard input inside the PowerShell host may not work well.
 - Full-screen TUI / console apps (editors, pagers, curses-style tools) are not supported.
 - Ctrl+C stops by restarting the PowerShell session (in-progress state is lost).

@@ -1,4 +1,4 @@
-#define MyVer "1.0.0"
+#define MyVer "1.1.0"
 [Setup]
 AppId={{A1B2C3D4-E5F6-7890-ABCD-EXSUDO000001}}
 AppName=EX SUDO TERMINAL

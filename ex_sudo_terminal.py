@@ -1,10 +1,10 @@
-"""EX SUDO TERMINAL - persistent PowerShell GUI for Windows. ©2026 EX Inc."""
+"""EX SUDO TERMINAL - persistent PowerShell GUI with ConPTY for interactive tools. ©2026 EX Inc."""
 import ctypes, json, os, queue, re, subprocess, sys, threading, time, urllib.request
 import tkinter as tk
 from tkinter import messagebox
 
 APP = "EX SUDO TERMINAL"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 COPYRIGHT = "\u00a92026 EX Inc."
 UPDATE_URL = "https://raw.githubusercontent.com/xtremestickman151-ops/ex-sudo-terminal/main/latest.json"
 GROK_CLI = "irm https://x.ai/cli/install.ps1 | iex"
@@ -13,8 +13,15 @@ NOWIN = 0x08000000
 BG, SIDE, CARD, CARD2, BORDER = "#000000", "#0a0a0a", "#1c1c1e", "#2a2a2d", "#3a3a3d"
 TXT, MUT, ACCENT, ERR = "#f2f2f4", "#9a9aa0", "#e5a524", "#ff453a"
 FONT, MONO = "Segoe UI", "Consolas"
-ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b.")
+ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b.")
+PS_PROMPT_RE = re.compile(r"(?m)^PS [^\r\n]*>\s*$")
 _MUTEX = None
+
+try:
+    import winpty
+    HAS_WINPTY = True
+except Exception:
+    HAS_WINPTY = False
 
 
 def res_path(name):
@@ -134,12 +141,125 @@ class NoticeBox(tk.Canvas):
         self.create_text(w//2, h//2, text=text, fill="#c7c7cc", font=(FONT, size))
 
 
-class Shell:
-    """Persistent PowerShell (or cmd under Wine). Commands end with MARKER."""
-    def __init__(self, on_out, on_done, on_err):
+# -------------------- shells --------------------
+class PtyShell:
+    """ConPTY-backed PowerShell via pywinpty. Supports interactive tools (grok, etc.)."""
+    def __init__(self, on_out, on_done, on_err, on_raw=None):
         self.on_out, self.on_done, self.on_err = on_out, on_done, on_err
-        self.proc = None; self.busy = False; self.mode = "ps"
-        self._buf = ""; self._lock = threading.Lock()
+        self.on_raw = on_raw
+        self.pty = None; self.alive = False; self.mode = "pty"
+        self._acc = ""; self._lock = threading.Lock()
+
+    def start(self):
+        if not HAS_WINPTY:
+            return False
+        apps = [
+            (os.environ.get("SystemRoot", r"C:\Windows") + r"\System32\WindowsPowerShell\v1.0\powershell.exe",
+             "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass"),
+            ("pwsh.exe", "pwsh.exe -NoLogo -NoProfile -ExecutionPolicy Bypass"),
+        ]
+        if is_wine():
+            apps = [(r"C:\windows\system32\cmd.exe", "cmd.exe /Q")] + apps
+        last = None
+        for app, cmdline in apps:
+            try:
+                self.pty = winpty.PTY(120, 40)
+                ok = self.pty.spawn(app, cmdline)
+                if not ok:
+                    raise RuntimeError("spawn returned False")
+                self.alive = True
+                threading.Thread(target=self._reader, daemon=True).start()
+                label = "ConPTY PowerShell" if "powershell" in app.lower() or "pwsh" in app.lower() else "ConPTY cmd (Wine)"
+                self.on_out("Ready (%s). Interactive tools (e.g. grok) run here.\n" % label)
+                return True
+            except Exception as e:
+                last = e
+                self.pty = None
+        self.on_err("ConPTY failed: %s" % last)
+        return False
+
+    def _reader(self):
+        try:
+            while self.pty and self.alive:
+                try:
+                    data = self.pty.read(blocking=False)
+                except Exception:
+                    data = None
+                if not data:
+                    if not self.pty.isalive():
+                        break
+                    time.sleep(0.02)
+                    continue
+                if self.on_raw:
+                    self.on_raw(data)
+                clean = strip_ansi(data).replace("\r\n", "\n").replace("\r", "\n")
+                if clean:
+                    self.on_out(clean)
+                with self._lock:
+                    self._acc = (self._acc + clean)[-4000:]
+                    if MARKER in self._acc:
+                        # optional marker support if a wrapper injected it
+                        before, _, rest = self._acc.partition(MARKER)
+                        code = rest.strip().split()[0] if rest.strip() else "0"
+                        self._acc = ""
+                        self.on_done(code)
+                    elif PS_PROMPT_RE.search(self._acc):
+                        self._acc = ""
+                        self.on_done("0")
+        except Exception as e:
+            self.on_err(str(e))
+        finally:
+            self.alive = False
+            self.on_done("shell-exit")
+
+    def write(self, s):
+        if not self.pty or not self.alive: return False
+        try:
+            self.pty.write(s)
+            return True
+        except Exception as e:
+            self.on_err(str(e)); return False
+
+    def run(self, cmd):
+        # Send a full line; caller enables key capture for interactive tools
+        return self.write(cmd + "\r\n")
+
+    def interrupt(self):
+        return self.write("\x03")
+
+    def stop(self):
+        """Hard restart the PTY (last resort)."""
+        try:
+            if self.pty and self.pty.pid:
+                subprocess.run(["taskkill", "/PID", str(self.pty.pid), "/T", "/F"],
+                               capture_output=True, creationflags=NOWIN if os.name == "nt" else 0)
+        except Exception:
+            pass
+        self.alive = False; self.pty = None
+        return self.start()
+
+    def close(self):
+        try:
+            if self.pty:
+                self.write("exit\r\n"); time.sleep(0.2)
+                if self.pty.pid:
+                    subprocess.run(["taskkill", "/PID", str(self.pty.pid), "/T", "/F"],
+                                   capture_output=True, creationflags=NOWIN if os.name == "nt" else 0)
+        except Exception:
+            pass
+        self.alive = False; self.pty = None
+
+    @property
+    def busy(self):
+        return False  # ConPTY is always live; UI tracks interactive capture
+
+
+class PipeShell:
+    """Fallback: pipes to powershell/cmd (no real interactive TUI)."""
+    def __init__(self, on_out, on_done, on_err, on_raw=None):
+        self.on_out, self.on_done, self.on_err = on_out, on_done, on_err
+        self.proc = None; self.busy = False; self.mode = "pipe"
+        self._lock = threading.Lock()
 
     def start(self):
         si = None; flags = 0
@@ -150,7 +270,7 @@ class Shell:
         if not is_wine():
             cmds.append((["powershell", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"], "ps"))
             cmds.append((["pwsh", "-NoLogo", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "-"], "ps"))
-        cmds.append((["cmd", "/Q", "/K", "prompt $G$S"], "cmd"))  # Wine smoke / last resort
+        cmds.append((["cmd", "/Q", "/K", "prompt $G$S"], "cmd"))
         last = None
         for cmd, mode in cmds:
             try:
@@ -160,8 +280,8 @@ class Shell:
                 self.mode = mode
                 threading.Thread(target=self._reader, daemon=True).start()
                 if mode == "ps":
-                    self._write("$ProgressPreference='SilentlyContinue'; [Console]::OutputEncoding=[Text.UTF8Encoding]::new()\n")
-                self.on_out("Ready (%s).\n" % ("PowerShell" if mode == "ps" else "cmd — Wine fallback"))
+                    self._write("$ProgressPreference='SilentlyContinue'\n")
+                self.on_out("Ready (pipes %s — interactive TUIs may hang; ConPTY unavailable).\n" % mode)
                 return True
             except Exception as e:
                 last = e
@@ -172,6 +292,9 @@ class Shell:
         if not self.proc or not self.proc.stdin: return
         try: self.proc.stdin.write(s); self.proc.stdin.flush()
         except Exception as e: self.on_err(str(e))
+
+    def write(self, s):
+        self._write(s); return True
 
     def _reader(self):
         try:
@@ -197,19 +320,19 @@ class Shell:
         if self.busy: return False
         self.busy = True
         if self.mode == "ps":
-            # Run command; always emit marker with exit code (works for native cmds & PS cmdlets)
             payload = ("%s; Write-Host ('%s' + $(if ($null -ne $LASTEXITCODE) {$LASTEXITCODE} elseif ($?) {0} else {1}))\r\n" % (cmd, MARKER))
         else:
-            # Single line so cmd expands %%ERRORLEVEL%% after the command
             payload = ("%s & echo %s%%ERRORLEVEL%%\r\n" % (cmd, MARKER))
         self._write(payload)
         return True
 
+    def interrupt(self):
+        return False
+
     def stop(self):
-        if not self.proc: return
+        if not self.proc: return False
         try:
             if os.name == "nt":
-                # Kill the whole tree; PowerShell child processes too
                 subprocess.run(["taskkill", "/PID", str(self.proc.pid), "/T", "/F"],
                                capture_output=True, creationflags=NOWIN)
             else:
@@ -217,9 +340,8 @@ class Shell:
         except Exception:
             try: self.proc.kill()
             except Exception: pass
-        self.busy = False
-        self.proc = None
-        self.start()
+        self.busy = False; self.proc = None
+        return self.start()
 
     def close(self):
         if self.proc:
@@ -228,6 +350,17 @@ class Shell:
             self.proc = None
 
 
+def make_shell(on_out, on_done, on_err, on_raw=None):
+    if HAS_WINPTY:
+        sh = PtyShell(on_out, on_done, on_err, on_raw)
+        if sh.start():
+            return sh
+    sh = PipeShell(on_out, on_done, on_err, on_raw)
+    sh.start()
+    return sh
+
+
+# -------------------- UI --------------------
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -238,7 +371,8 @@ class App(tk.Tk):
         try: self._icon = tk.PhotoImage(file=res_path("logo256.png")); self.iconphoto(True, self._icon)
         except Exception: pass
         self.geometry("980x640"); self.minsize(760, 520); self.configure(bg=BG)
-        self.q = queue.Queue(); self.hist = []; self.hix = -1; self.busy = False
+        self.q = queue.Queue(); self.hist = []; self.hix = -1
+        self.capturing = False  # keystrokes → PTY
         self.protocol("WM_DELETE_WINDOW", self.on_close)
 
         side = tk.Frame(self, bg=SIDE, width=200); side.pack(side="left", fill="y"); side.pack_propagate(False)
@@ -266,14 +400,18 @@ class App(tk.Tk):
         up.pack(fill="x", padx=12, pady=2); up.bind("<Button-1>", lambda e: self.update_click())
         up.bind("<Enter>", lambda e: up.configure(bg=CARD2, fg=TXT)); up.bind("<Leave>", lambda e: up.configure(bg=SIDE, fg=MUT))
         NoticeBox(side, COPYRIGHT, SIDE, w=160, h=28).pack(side="bottom", pady=(4, 14))
-        tk.Label(side, text="PowerShell GUI · persistent session\n· run as admin when you need it",
+        tk.Label(side, text="ConPTY PowerShell · interactive\n· grok runs in this window",
                  bg=SIDE, fg=MUT, font=(FONT, 8), justify="left").pack(side="bottom", padx=20, pady=(4, 2))
 
         self.build_term(); self.build_about(); self.show("Terminal")
-        self.shell = Shell(lambda t: self.q.put(("out", t)), lambda c: self.q.put(("done", c)),
-                           lambda e: self.q.put(("err", e)))
-        self.after(100, self.shell.start); self.after(200, self.pump)
-        self.bind_all("<Control-c>", self.ctrl_c)
+        self.shell = None
+        self.after(80, self._boot_shell); self.after(50, self.pump)
+        self.bind_all("<Key>", self.on_key, add="+")
+
+    def _boot_shell(self):
+        self.shell = make_shell(lambda t: self.q.put(("out", t)),
+                                lambda c: self.q.put(("done", c)),
+                                lambda e: self.q.put(("err", e)))
 
     def show(self, name):
         for n, p in self.pages.items():
@@ -288,18 +426,24 @@ class App(tk.Tk):
         else:
             tk.Label(bar, text="Administrator", bg=BG, fg=ACCENT, font=(FONT, 10, "bold")).pack(side="left", padx=(0, 8))
         PillButton(bar, "Install Grok CLI", self.install_grok, w=150, h=32, fill=ACCENT, fg="#1a1000", bg=BG).pack(side="left", padx=(0, 8))
-        PillButton(bar, "Clear", self.clear, w=90, h=32, fill=CARD2, fg=TXT, bg=BG).pack(side="left")
+        PillButton(bar, "Clear", self.clear, w=90, h=32, fill=CARD2, fg=TXT, bg=BG).pack(side="left", padx=(0, 8))
+        PillButton(bar, "End interactive", self.end_capture, w=130, h=32, fill=CARD2, fg=TXT, bg=BG).pack(side="left")
         self.status = tk.StringVar(value="Idle")
         tk.Label(bar, textvariable=self.status, bg=BG, fg=MUT, font=(FONT, 9)).pack(side="right")
 
         outf = tk.Frame(p, bg=BORDER); outf.pack(fill="both", expand=True)
         self.out = tk.Text(outf, bg="#0d0d0f", fg=TXT, insertbackground=TXT, relief="flat",
-                           font=(MONO, 11), wrap="word", state="disabled", padx=10, pady=10,
-                           highlightthickness=0)
+                           font=(MONO, 11), wrap="word", state="normal", padx=10, pady=10,
+                           highlightthickness=0, takefocus=1)
         self.out.pack(fill="both", expand=True, padx=1, pady=1)
         self.out.tag_configure("cmd", foreground=ACCENT)
         self.out.tag_configure("err", foreground=ERR)
         self.out.tag_configure("meta", foreground=MUT)
+        self.out.bind("<Key>", self.on_term_key)
+        self.out.bind("<Button-1>", lambda e: self.out.focus_set())
+        # Keep content read-only-ish: block edits but allow us to insert via append
+        self.out.bind("<<Modified>>", self._guard_out)
+        self._out_len = "1.0"
 
         row = tk.Frame(p, bg=CARD); row.pack(fill="x", pady=(8, 0), ipady=4)
         tk.Label(row, text="PS>", bg=CARD, fg=ACCENT, font=(MONO, 11, "bold")).pack(side="left", padx=(10, 6))
@@ -308,12 +452,21 @@ class App(tk.Tk):
         self.inp.bind("<Return>", self.submit); self.inp.bind("<Up>", self.hist_up); self.inp.bind("<Down>", self.hist_down)
         self.inp.focus_set()
 
+    def _guard_out(self, e=None):
+        # Prevent user typing from mutating Text; PTY keys are handled separately
+        try:
+            if self.out.edit_modified():
+                self.out.edit_modified(False)
+        except Exception:
+            pass
+
     def build_about(self):
         p = self.pages["About"]
-        c = Card(p, "ABOUT & UPDATES", height=220); c.pack(fill="x")
+        c = Card(p, "ABOUT & UPDATES", height=260); c.pack(fill="x")
         tk.Label(c.body, text="%s  version %s" % (APP, APP_VERSION), bg=CARD, fg=TXT, font=(FONT, 12, "bold")).pack(anchor="w")
-        tk.Label(c.body, text="Runs PowerShell in a persistent session so cd and variables stick.\n"
-                 "Does not elevate every command — use Run as admin when you need elevated rights.",
+        tk.Label(c.body, text="Uses Windows ConPTY (pywinpty) so interactive tools like grok run\n"
+                 "inside this window. Type at PS>, then while a command is Running your\n"
+                 "keystrokes go to the terminal. Ctrl+C / Esc interrupt.",
                  bg=CARD, fg=MUT, font=(FONT, 9), justify="left").pack(anchor="w", pady=6)
         NoticeBox(c.body, COPYRIGHT, CARD, w=170, h=30, size=9).pack(anchor="w", pady=(4, 8))
         row = tk.Frame(c.body, bg=CARD); row.pack(fill="x")
@@ -323,10 +476,27 @@ class App(tk.Tk):
     def append(self, text, tag=None):
         self.out.configure(state="normal")
         self.out.insert("end", text, tag)
-        self.out.see("end"); self.out.configure(state="disabled")
+        self.out.see("end")
+        self._out_len = self.out.index("end-1c")
 
     def clear(self):
-        self.out.configure(state="normal"); self.out.delete("1.0", "end"); self.out.configure(state="disabled")
+        self.out.delete("1.0", "end"); self._out_len = "1.0"
+
+    def set_capturing(self, on):
+        self.capturing = on
+        if on:
+            self.status.set("Interactive — keys go to terminal (Ctrl+C / Esc)")
+            self.inp.configure(state="disabled")
+            self.out.focus_set()
+        else:
+            self.status.set("Idle")
+            self.inp.configure(state="normal")
+            self.inp.focus_set()
+
+    def end_capture(self):
+        if self.capturing:
+            self.set_capturing(False)
+            self.append("(interactive capture ended)\n", "meta")
 
     def pump(self):
         while not self.q.empty():
@@ -334,44 +504,101 @@ class App(tk.Tk):
             if kind == "out": self.append(v)
             elif kind == "err": self.append(v + "\n", "err"); self.status.set("Error")
             elif kind == "done":
-                self.busy = False; self.status.set("Idle · exit %s" % v); self.inp.configure(state="normal"); self.inp.focus_set()
+                if v == "shell-exit":
+                    self.append("\n(shell exited — restarting)\n", "meta")
+                    self.set_capturing(False)
+                    self.after(200, self._boot_shell)
+                else:
+                    # Prompt seen / marker — leave interactive if it was a short command;
+                    # keep capturing if user is in a long interactive session? Heuristic: end capture.
+                    if self.capturing:
+                        self.set_capturing(False)
+                    else:
+                        self.status.set("Idle · exit %s" % v)
             elif kind == "upd": self.update_result(*v)
-        self.after(50, self.pump)
+        self.after(40, self.pump)
 
     def submit(self, e=None):
         cmd = self.inp.get().strip()
-        if not cmd: return "break"
-        if self.busy:
-            self.append("(busy — Ctrl+C to stop)\n", "meta"); return "break"
+        if not cmd or not self.shell: return "break"
+        if self.capturing:
+            # In interactive mode Enter from PS> shouldn't steal; ignore
+            return "break"
         self.hist.append(cmd); self.hix = len(self.hist)
         self.inp.delete(0, "end")
         self.append("PS> %s\n" % cmd, "cmd")
-        self.busy = True; self.status.set("Running…"); self.inp.configure(state="disabled")
+        # Enable key capture immediately so interactive tools work
+        self.set_capturing(True)
         if not self.shell.run(cmd):
-            self.busy = False; self.status.set("Shell not ready"); self.inp.configure(state="normal")
+            self.set_capturing(False)
             self.append("Shell is not ready.\n", "err")
         return "break"
 
     def hist_up(self, e=None):
-        if not self.hist: return
+        if self.capturing or not self.hist: return
         self.hix = max(0, self.hix - 1); self.inp.delete(0, "end"); self.inp.insert(0, self.hist[self.hix]); return "break"
 
     def hist_down(self, e=None):
-        if not self.hist: return
+        if self.capturing or not self.hist: return
         self.hix = min(len(self.hist), self.hix + 1)
         self.inp.delete(0, "end")
         if self.hix < len(self.hist): self.inp.insert(0, self.hist[self.hix])
         return "break"
 
-    def ctrl_c(self, e=None):
-        if self.busy:
-            self.append("^C\n", "err"); self.status.set("Stopping…")
-            threading.Thread(target=self.shell.stop, daemon=True).start()
+    def _key_to_pty(self, event):
+        """Map a Tk key event to PTY bytes. Returns True if handled."""
+        if not self.shell: return False
+        ks, ch = event.keysym, event.char
+        ctrl = bool(event.state & 0x4)
+        if ks in ("Control_L", "Control_R", "Shift_L", "Shift_R", "Alt_L", "Alt_R"):
+            return True
+        if ctrl and ks.lower() == "c":
+            self.append("^C\n", "err")
+            self.shell.interrupt()
+            return True
+        if ks == "Escape":
+            self.shell.write("\x1b")
+            self.set_capturing(False)
+            self.append("(Esc — left interactive mode; Ctrl+C sent interrupt earlier if used)\n", "meta")
+            return True
+        mapping = {
+            "Return": "\r", "KP_Enter": "\r", "BackSpace": "\x7f", "Delete": "\x1b[3~",
+            "Tab": "\t", "Up": "\x1b[A", "Down": "\x1b[B", "Right": "\x1b[C", "Left": "\x1b[D",
+            "Home": "\x1b[H", "End": "\x1b[F", "Prior": "\x1b[5~", "Next": "\x1b[6~",
+        }
+        if ks in mapping:
+            self.shell.write(mapping[ks]); return True
+        if ctrl and ch and ch.isalpha():
+            self.shell.write(chr(ord(ch.lower()) - ord("a") + 1)); return True
+        if ch and ch.isprintable():
+            self.shell.write(ch); return True
+        return False
+
+    def on_term_key(self, event):
+        if self.capturing:
+            self._key_to_pty(event)
+            return "break"  # never mutate the Text widget
+        # Idle: ignore typing in output (focus PS> instead)
+        if event.keysym not in ("Control_L", "Control_R", "Shift_L", "Shift_R"):
+            self.inp.focus_set()
         return "break"
 
+    def on_key(self, event):
+        # Global: when capturing, route keys even if focus left the Text
+        if not self.capturing:
+            return
+        w = self.focus_get()
+        if w is self.inp:
+            return  # shouldn't happen while disabled
+        # Avoid double-handling when Text already got it
+        if w is self.out:
+            return
+        if self._key_to_pty(event):
+            return "break"
+
     def install_grok(self):
-        if self.busy:
-            messagebox.showinfo(APP, "Wait for the current command to finish, or press Ctrl+C."); return
+        if self.capturing:
+            messagebox.showinfo(APP, "Finish or Esc the current interactive session first."); return
         if not messagebox.askyesno(APP, "Run this PowerShell command?\n\n%s\n\nIt downloads and runs x.ai's install script." % GROK_CLI):
             return
         self.inp.delete(0, "end"); self.inp.insert(0, GROK_CLI); self.submit()
@@ -396,7 +623,8 @@ class App(tk.Tk):
             messagebox.showinfo(APP, msg)
 
     def on_close(self):
-        try: self.shell.close()
+        try:
+            if self.shell: self.shell.close()
         except Exception: pass
         self.destroy()
 
