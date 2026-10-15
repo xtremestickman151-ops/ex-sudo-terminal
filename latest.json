@@ -1,7 +1,7 @@
 {
-  "version": "1.1.0",
-  "url": "/EX.SUDO.TERMINAL.Setup.1.1.0.exe",
-  "full_url": "/EX_SUDO_TERMINAL.zip",
-  "installer_url": "/EX.SUDO.TERMINAL.Setup.1.1.0.exe",
-  "notes": "ConPTY: interactive tools like grok run inside the window. Keystrokes are forwarded while Running; Ctrl+C interrupts. Run the installer over your existing install."
+  "version": "1.1.1",
+  "url": "https://github.com/xtremestickman151-ops/ex-sudo-terminal/releases/download/v1.1.1/EX.SUDO.TERMINAL.Setup.1.1.1.exe",
+  "full_url": "https://github.com/xtremestickman151-ops/ex-sudo-terminal/releases/download/v1.1.1/EX_SUDO_TERMINAL.zip",
+  "installer_url": "https://github.com/xtremestickman151-ops/ex-sudo-terminal/releases/download/v1.1.1/EX.SUDO.TERMINAL.Setup.1.1.1.exe",
+  "notes": "Adds a Send button next to the PS> input (same as Enter). Interactive ConPTY mode unchanged. Run the installer over your existing install."
 }
