@@ -4,7 +4,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 APP = "EX SUDO TERMINAL"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.1.1"
 COPYRIGHT = "\u00a92026 EX Inc."
 UPDATE_URL = "https://raw.githubusercontent.com/xtremestickman151-ops/ex-sudo-terminal/main/latest.json"
 GROK_CLI = "irm https://x.ai/cli/install.ps1 | iex"
@@ -450,6 +450,7 @@ class App(tk.Tk):
         self.inp = tk.Entry(row, bg=CARD, fg=TXT, insertbackground=TXT, relief="flat", font=(MONO, 11))
         self.inp.pack(side="left", fill="x", expand=True, ipady=6)
         self.inp.bind("<Return>", self.submit); self.inp.bind("<Up>", self.hist_up); self.inp.bind("<Down>", self.hist_down)
+        PillButton(row, "Send", lambda: self.submit(), w=80, h=32, fill=ACCENT, fg="#1a1000", bg=CARD).pack(side="left", padx=(8, 8))
         self.inp.focus_set()
 
     def _guard_out(self, e=None):
